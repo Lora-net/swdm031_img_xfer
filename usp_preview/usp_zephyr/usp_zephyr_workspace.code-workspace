@@ -1,7 +1,0 @@
-{
-        "folders": [
-            { "name": "USP for Zephyr", "path": "." },
-            { "name": "USP", "path": "../modules/lib/usp" },
-            { "name": "Zephyr Workspace (all files)", "path": ".." }
-        ],
-}

@@ -1,0 +1,7 @@
+{
+        "folders": [
+            { "name": "swdm031_img_xfer", "path": "." },
+            { "name": "USP for Zephyr", "path": "../usp_zephyr" },
+            { "name": "USP", "path": "../modules/lib/usp" }
+        ],
+}

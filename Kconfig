@@ -1,21 +1,17 @@
-# Copyright (c) 2025 Semtech Corporation
+# Copyright (c) 2026 Semtech Corporation
 # SPDX-License-Identifier: Apache-2.0
 
 choice DEVICE_ROLE
-   prompt "Define as a transmitter or receiver role"
-   default TRANSMITTER
+   prompt "Define as an initiator or slave role"
+   default INITIATOR
    help
       Select a role to run
 
-   config TRANSMITTER
-      bool "As a transmitter role"
+   config INITIATOR
+      bool "As an initiator role"
 
-   config RECEIVER
-      bool "As a receiver role"
+   config SLAVE
+      bool "As a slave role"
 endchoice # DEVICE_ROLE
-
-config FLRC_BURST_FIFO_IRQ_POLLING
-    bool "Allow to activate the polling of FIFO IRQ when IRQ not available on some MCU (used for xiao vs LoRa Plus EVK)"
-    default y
 
 source "Kconfig.zephyr"

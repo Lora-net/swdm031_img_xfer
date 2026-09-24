@@ -32,45 +32,38 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
-#include <stdint.h>   // C99 types
-#include <stdbool.h>  // bool type
+#include <stdint.h>
+#include <stdbool.h>
 
 #include <lvgl.h>
 #include <zephyr/device.h>
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
-#include <zephyr/drivers/display.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/devicetree.h>
 
 #include <smtc_modem_hal.h>
 #include <smtc_zephyr_usp_api.h>
 #include <smtc_sw_platform_helper.h>
-#include "apps_configuration.h"
-#include "lr20xx_system.h"
-
-#if CONFIG_TRANSMITTER
-#include "flrc_burst_tx.h"
-#endif
+#include <smtc_flrp_api.h>
+#include "app_flrp_img_xfer.h"
+#include "oled_display.h"
 
 /*
  * -----------------------------------------------------------------------------
  * --- PRIVATE MACROS-----------------------------------------------------------
  */
 
-LOG_MODULE_REGISTER( img_xfer, LOG_LEVEL_INF );
+LOG_MODULE_REGISTER( main, LOG_LEVEL_INF );
 
-/**
- * @brief Led on the XIAO board.
- */
+#if CONFIG_INITIATOR
+extern volatile bool flrp_img_xfer_session_idle_tick;
+#endif
+
 #define LED0_NODE DT_ALIAS( led0 )
 #if !DT_NODE_HAS_STATUS( LED0_NODE, okay )
 #error "Unsupported board: led0 devicetree alias is not defined"
 #endif
 
-/**
- * @brief User button on the XIAO board.
- */
 #define USER_BUTTON_NODE DT_ALIAS( smtc_user_button )
 #if !DT_NODE_HAS_STATUS( USER_BUTTON_NODE, okay )
 #error "Unsupported board: smtc-user-button devicetree alias is not defined"
@@ -90,20 +83,19 @@ static const struct gpio_dt_spec button  = GPIO_DT_SPEC_GET_OR( USER_BUTTON_NODE
  */
 
 static struct gpio_callback button_cb_data;
-static volatile bool        user_button_is_press = false;  // Flag for button status
+
+static volatile bool     user_button_short_press_pending = false;
+static volatile bool     button_physically_pressed       = false;
+static volatile bool     long_press_handled_this_hold    = false;
+static volatile uint32_t button_press_start_ms           = 0;
 
 /*
  * -----------------------------------------------------------------------------
  * --- PRIVATE VARIABLES -------------------------------------------------------
  */
 
-/**
- * @brief Startup animation
- */
 static uint8_t anim_completed_count = 0;
 static bool    anim_end_flag        = false;
-
-K_SEM_DEFINE( periodical_event_sem, 0, 1 );
 
 /*
  * -----------------------------------------------------------------------------
@@ -112,9 +104,11 @@ K_SEM_DEFINE( periodical_event_sem, 0, 1 );
 
 static void boot_animation( void );
 static void animation_completed_cb( lv_anim_t* anim );
-
 static int  configure_user_button( void );
 static void user_button_callback( const struct device* dev, struct gpio_callback* cb, uint32_t pins );
+#if CONFIG_INITIATOR
+static void initiator_show_run_mode( bool periodic_mode );
+#endif
 
 /*
  * -----------------------------------------------------------------------------
@@ -123,7 +117,7 @@ static void user_button_callback( const struct device* dev, struct gpio_callback
 
 int main( void )
 {
-    LOG_INF( "===== LR20xx Image Transfer Demo =====" );
+    LOG_INF( "===== FLRP Image Transfer Demo =====" );
 
     /* Startup logo */
     boot_animation( );
@@ -141,11 +135,10 @@ int main( void )
     /* Boot animation has ended. Display for a while.*/
     k_msleep( 1000 );
 
-    if( !gpio_is_ready_dt( &usr_led ) )
-    {
-        LOG_ERR( "user led is not ready" );
-    }
-    else
+    display_thread_init( );
+    k_msleep( 10 );
+
+    if( gpio_is_ready_dt( &usr_led ) )
     {
         gpio_pin_configure_dt( &usr_led, GPIO_OUTPUT_ACTIVE );
     }
@@ -158,38 +151,65 @@ int main( void )
     SMTC_SW_PLATFORM_INIT( );
     SMTC_SW_PLATFORM_VOID( smtc_rac_init( ) );
 
-    lr20xx_system_version_t version;
-    lr20xx_status_t         status;
-
-    void* radio_driver_context = smtc_rac_get_radio_driver_context( );
-    /* Get the firmware version */
-    status = lr20xx_system_get_version( radio_driver_context, &version );
-    if( status == LR20XX_STATUS_OK )
+    if( !flrp_img_xfer_init( ) )
     {
-        LOG_INF( "Major firmware version: 0x%02X", version.major );
-        LOG_INF( "Minor firmware version: 0x%02X", version.minor );
+        LOG_ERR( "FLRP init failed" );
+        display_text( DISPLAY_ROW4, "Init failed!" );
     }
-    /* The entry function for transmitter or receiver. */
-    image_transfer_entry( );
+
+#if CONFIG_INITIATOR
+    uint32_t periodic_timestamp_ms   = smtc_modem_hal_get_time_in_ms( );
+    bool     initiator_periodic_mode = true;
+
+    initiator_show_run_mode( initiator_periodic_mode );
+#endif
+
+    struct k_sem* event_sem = flrp_img_xfer_get_event_sem( );
 
     while( true )
     {
-        if( user_button_is_press == true )
-        {
-            user_button_is_press = false;
+#if CONFIG_INITIATOR
+        uint32_t now_ms    = smtc_modem_hal_get_time_in_ms( );
+        bool     flrp_idle = ( smtc_flrp_call_run( ) == false );
 
-#if CONFIG_TRANSMITTER
-            flrc_raw_bit_rate_changed( );
+        if( flrp_img_xfer_session_idle_tick )
+        {
+            flrp_img_xfer_session_idle_tick = false;
+            periodic_timestamp_ms           = now_ms;
+        }
+
+        if( button_physically_pressed && !long_press_handled_this_hold &&
+            ( ( now_ms - button_press_start_ms ) >= FLRP_IMG_XFER_BUTTON_LONG_PRESS_MS ) )
+        {
+            long_press_handled_this_hold = true;
+            initiator_periodic_mode      = !initiator_periodic_mode;
+            periodic_timestamp_ms        = now_ms;
+            initiator_show_run_mode( initiator_periodic_mode );
+            display_text( DISPLAY_ROW6, "Mode switched" );
+            LOG_INF( "Run mode: %s", initiator_periodic_mode ? "periodic" : "button" );
+        }
+        else if( user_button_short_press_pending )
+        {
+            user_button_short_press_pending = false;
+            if( !initiator_periodic_mode )
+            {
+                flrp_img_xfer_start_transfer( );
+            }
+        }
+
+        if( initiator_periodic_mode && flrp_idle &&
+            ( ( now_ms - periodic_timestamp_ms ) > FLRP_IMG_XFER_INITIATOR_PERIODIC_MS ) )
+        {
+            flrp_img_xfer_start_transfer( );
+        }
+
+        k_sem_take( event_sem, K_MSEC( button_physically_pressed ? 100 : 1000 ) );
+#else
+        k_sem_take( event_sem, K_MSEC( 1000 ) );
 #endif
-            LOG_INF( "User button pushed" );
-        }
-
-        if( user_button_is_press == false )
-        {
-            k_sem_take( &periodical_event_sem, K_MSEC( 1000 ) );
-        }
         gpio_pin_toggle_dt( &usr_led );
     }
+
     return 0;
 }
 
@@ -200,8 +220,9 @@ int main( void )
 
 static void animation_completed_cb( lv_anim_t* anim )
 {
+    ARG_UNUSED( anim );
     anim_completed_count++;
-    if( anim_completed_count >= 2 )  // Both width and height animations completed
+    if( anim_completed_count >= 2 )
     {
         anim_end_flag = true;
     }
@@ -209,7 +230,6 @@ static void animation_completed_cb( lv_anim_t* anim )
 
 static void boot_animation( void )
 {
-    // Reset animation completion counter
     anim_completed_count = 0;
     anim_end_flag        = false;
 
@@ -218,14 +238,11 @@ static void boot_animation( void )
     lv_img_set_src( img, &lora_logo );
     lv_obj_align( img, LV_ALIGN_CENTER, 0, 0 );
 
-    // Set the initial size - 10%
     uint16_t target_w = lora_logo.header.w;
     uint16_t target_h = lora_logo.header.h;
     lv_obj_set_size( img, target_w * 0.1, target_h * 0.1 );
 
-    // Define the animation - width and height
     lv_anim_t anim_w, anim_h;
-    // width
     lv_anim_init( &anim_w );
     lv_anim_set_var( &anim_w, img );
     lv_anim_set_exec_cb( &anim_w, ( lv_anim_exec_xcb_t ) lv_obj_set_width );
@@ -245,21 +262,54 @@ static void boot_animation( void )
 
 static void user_button_callback( const struct device* dev, struct gpio_callback* cb, uint32_t pins )
 {
-    static uint32_t last_press_timestamp_ms = 0;
+    ARG_UNUSED( dev );
+    ARG_UNUSED( cb );
+    ARG_UNUSED( pins );
 
-    // Debounce the button press, avoid multiple triggers
-    if( ( int32_t ) ( smtc_modem_hal_get_time_in_ms( ) - last_press_timestamp_ms ) > 500 )
+    uint32_t now_ms = smtc_modem_hal_get_time_in_ms( );
+
+    if( gpio_pin_get_dt( &button ) > 0 )
     {
-        last_press_timestamp_ms = smtc_modem_hal_get_time_in_ms( );
-        user_button_is_press    = true;
+        button_press_start_ms        = now_ms;
+        long_press_handled_this_hold = false;
+        button_physically_pressed    = true;
     }
-    // Wake up the main thread
-    k_sem_give( &periodical_event_sem );
+#if CONFIG_INITIATOR
+    else
+    {
+        uint32_t hold_ms = now_ms - button_press_start_ms;
+
+        if( !long_press_handled_this_hold && ( hold_ms >= FLRP_IMG_XFER_BUTTON_DEBOUNCE_MS ) &&
+            ( hold_ms < FLRP_IMG_XFER_BUTTON_LONG_PRESS_MS ) )
+        {
+            user_button_short_press_pending = true;
+        }
+        button_physically_pressed = false;
+    }
+#endif
+
+    k_sem_give( flrp_img_xfer_get_event_sem( ) );
 }
+
+#if CONFIG_INITIATOR
+static void initiator_show_run_mode( bool periodic_mode )
+{
+    if( periodic_mode )
+    {
+        display_text( DISPLAY_ROW5, "Mode: Auto (2s idle)" );
+    }
+    else
+    {
+        display_text( DISPLAY_ROW5, "Mode: Button" );
+    }
+    display_text( DISPLAY_ROW4, "Hold btn 2s: switch" );
+}
+#endif
 
 static int configure_user_button( void )
 {
     int ret = 0;
+
     if( !gpio_is_ready_dt( &button ) )
     {
         printk( "Error: button device %s is not ready\n", button.port->name );
@@ -273,7 +323,7 @@ static int configure_user_button( void )
         return 1;
     }
 
-    ret = gpio_pin_interrupt_configure_dt( &button, GPIO_INT_EDGE_TO_ACTIVE );
+    ret = gpio_pin_interrupt_configure_dt( &button, GPIO_INT_EDGE_BOTH );
     if( ret != 0 )
     {
         printk( "Error %d: failed to configure interrupt on %s pin %d\n", ret, button.port->name, button.pin );
